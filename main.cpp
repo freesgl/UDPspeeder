@@ -1,5 +1,12 @@
 #include "common.h"
 #include "log.h"
+#include "git_version.h"
+#include "lib/rs.h"
+#include "packet.h"
+#include "connection.h"
+#include "fd_manager.h"
+#include "delay_manager.h"
+#include "fec_manager.h"
 
 using  namespace std;
 
@@ -9,922 +16,1149 @@ typedef long long i64_t;
 typedef unsigned int u32_t;
 typedef int i32_t;
 
-typedef u64_t anti_replay_seq_t;
-int disable_replay_filter=0;
-int dup_num=1;
-int dup_delay_min=20;   //0.1ms
-int dup_delay_max=20;
-//int dup_first_delay=9000;   //0.1ms
+//int dup_num=1;
+//int dup_delay_min=20;   //0.1ms
+//int dup_delay_max=20;
 
-int jitter_min=0;
-int jitter_max=0;
 
-int iv_min=2;
-int iv_max=16;//< 256;
-int random_number_fd=-1;
 
-int remote_fd=-1;
-int local_fd=-1;
-int is_client = 0, is_server = 0;
-int local_listen_fd=-1;
+//int random_number_fd=-1;
 
-int disable_conv_clear=0;
 int mtu_warn=1350;
-u32_t remote_address_uint32=0;
 
-char local_address[100], remote_address[100];
+int disable_mtu_warn=1;
+int disable_fec=0;
+
+int debug_force_flush_fec=0;
+
+int fec_data_num=20;
+int fec_redundant_num=10;
+int fec_mtu=1250;
+int fec_pending_num=200;
+int fec_pending_time=8*1000; //8ms
+int fec_type=1;
+
+int jitter_min=0*1000;
+int jitter_max=0*1000;
+
+int output_interval_min=0*1000;
+int output_interval_max=0*1000;
+
+int fix_latency=0;
+
+u32_t local_ip_uint32,remote_ip_uint32=0;
+char local_ip[100], remote_ip[100];
 int local_port = -1, remote_port = -1;
-int multi_process_mode=0;
-const u32_t anti_replay_buff_size=10000;
 
-char key_string[1000]= "secret key";
+//u64_t last_report_time=0;
 
-int random_drop=0;
 
-u64_t last_report_time=0;
-int report_interval=0;
+conn_manager_t conn_manager;
+delay_manager_t delay_manager;
+fd_manager_t fd_manager;
 
-u64_t packet_send_count=0;
-u64_t dup_packet_send_count=0;
-u64_t packet_recv_count=0;
-u64_t dup_packet_recv_count=0;
+int time_mono_test=1;
 
-int random_between(u32_t a,u32_t b)
-{
-	if(a>b)
-	{
-		mylog(log_fatal,"min >max?? %d %d\n",a ,b);
-		myexit(1);
-	}
-	if(a==b)return a;
-	else return a+get_true_random_number()%(b+1-a);
-}
 
-int max_pending_packet=0;
+const int disable_conv_clear=0;
+
+int socket_buf_size=1024*1024;
+
+
 int VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV;
 
-struct anti_replay_t
+int init_listen_socket()
 {
-	u64_t max_packet_received;
+	local_listen_fd =socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 
-	u64_t replay_buffer[anti_replay_buff_size];
-	unordered_set<u64_t> st;
-	u32_t const_id;
-	u32_t anti_replay_seq;
-	int index;
-	anti_replay_seq_t get_new_seq_for_send()
-	{
-		anti_replay_seq_t res=const_id;
-		res<<=32u;
-		anti_replay_seq++;
-		res|=anti_replay_seq;
-		return res;
-	}
-	void prepare()
-	{
-		anti_replay_seq=get_true_random_number();//random first seq
-		const_id=get_true_random_number_nz();
-	}
-	anti_replay_t()
-	{
-		memset(replay_buffer,0,sizeof(replay_buffer));
-		st.rehash(anti_replay_buff_size*10);
-		max_packet_received=0;
-		index=0;
-	}
-
-	int is_vaild(u64_t seq)
-	{
-		//if(disable_replay_filter) return 1;
-		if(seq==0)
-		{
-			mylog(log_debug,"seq=0\n");
-			return 0;
-		}
-		if(st.find(seq)!=st.end() )
-		{
-			mylog(log_trace,"seq %llx exist\n",seq);
-			return 0;
-		}
-
-		if(replay_buffer[index]!=0)
-		{
-			assert(st.find(replay_buffer[index])!=st.end());
-			st.erase(replay_buffer[index]);
-		}
-		replay_buffer[index]=seq;
-		st.insert(seq);
-		index++;
-		if(index==int(anti_replay_buff_size)) index=0;
-
-		return 1; //for complier check
-	}
-}anti_replay;
-struct conn_manager_t  //TODO change map to unordered map
-{
-	//typedef hash_map map;
-	unordered_map<u64_t,u32_t> u64_to_fd;  //conv and u64 are both supposed to be uniq
-	unordered_map<u32_t,u64_t> fd_to_u64;
-
-	unordered_map<u32_t,u64_t> fd_last_active_time;
-
-	unordered_map<u32_t,u64_t>::iterator clear_it;
-
-	unordered_map<u32_t,u64_t>::iterator it;
-	unordered_map<u32_t,u64_t>::iterator old_it;
-
-	//void (*clear_function)(uint64_t u64) ;
-
-	long long last_clear_time;
-	list<int> clear_list;
-	conn_manager_t()
-	{
-		clear_it=fd_last_active_time.begin();
-		long long last_clear_time=0;
-		rehash();
-		//clear_function=0;
-	}
-	~conn_manager_t()
-	{
-		clear();
-	}
-	int get_size()
-	{
-		return fd_to_u64.size();
-	}
-	void rehash()
-	{
-		u64_to_fd.rehash(10007);
-		fd_to_u64.rehash(10007);
-		fd_last_active_time.rehash(10007);
-	}
-	void clear()
-	{
-		if(disable_conv_clear) return ;
-
-		for(it=fd_to_u64.begin();it!=fd_to_u64.end();it++)
-		{
-			//int fd=int((it->second<<32u)>>32u);
-			close(  it->first);
-		}
-		u64_to_fd.clear();
-		fd_to_u64.clear();
-		fd_last_active_time.clear();
-
-		clear_it=fd_last_active_time.begin();
-
-	}
-	int exist_fd(u32_t fd)
-	{
-		return fd_to_u64.find(fd)!=fd_to_u64.end();
-	}
-	int exist_u64(u64_t u64)
-	{
-		return u64_to_fd.find(u64)!=u64_to_fd.end();
-	}
-	u32_t find_fd_by_u64(u64_t u64)
-	{
-		return u64_to_fd[u64];
-	}
-	u64_t find_u64_by_fd(u32_t fd)
-	{
-		return fd_to_u64[fd];
-	}
-	int update_active_time(u32_t fd)
-	{
-		return fd_last_active_time[fd]=get_current_time();
-	}
-	int insert_fd(u32_t fd,u64_t u64)
-	{
-		u64_to_fd[u64]=fd;
-		fd_to_u64[fd]=u64;
-		fd_last_active_time[fd]=get_current_time();
-		return 0;
-	}
-	int erase_fd(u32_t fd)
-	{
-		if(disable_conv_clear) return 0;
-		u64_t u64=fd_to_u64[fd];
-
-		u32_t ip= (u64 >> 32u);
-
-		int port= uint16_t((u64 << 32u) >> 32u);
-
-		mylog(log_info,"fd %d cleared,assocated adress %s,%d\n",fd,my_ntoa(ip),port);
-
-		close(fd);
-
-		fd_to_u64.erase(fd);
-		u64_to_fd.erase(u64);
-		fd_last_active_time.erase(fd);
-		return 0;
-	}
-	void check_clear_list()
-	{
-		while(!clear_list.empty())
-		{
-			int fd=*clear_list.begin();
-			clear_list.pop_front();
-			erase_fd(fd);
-		}
-	}
-	int clear_inactive()
-	{
-		if(get_current_time()-last_clear_time>conv_clear_interval)
-		{
-			last_clear_time=get_current_time();
-			return clear_inactive0();
-		}
-		return 0;
-	}
-	int clear_inactive0()
-	{
-		if(disable_conv_clear) return 0;
-
-
-		//map<uint32_t,uint64_t>::iterator it;
-		int cnt=0;
-		it=clear_it;
-		int size=fd_last_active_time.size();
-		int num_to_clean=size/conv_clear_ratio+conv_clear_min;   //clear 1/10 each time,to avoid latency glitch
-
-		u64_t current_time=get_current_time();
-		for(;;)
-		{
-			if(cnt>=num_to_clean) break;
-			if(fd_last_active_time.begin()==fd_last_active_time.end()) break;
-
-			if(it==fd_last_active_time.end())
-			{
-				it=fd_last_active_time.begin();
-			}
-
-			if( current_time -it->second  >conv_timeout )
-			{
-				//mylog(log_info,"inactive conv %u cleared \n",it->first);
-				old_it=it;
-				it++;
-				u32_t fd= old_it->first;
-				erase_fd(old_it->first);
-
-
-			}
-			else
-			{
-				it++;
-			}
-			cnt++;
-		}
-		return 0;
-	}
-}conn_manager;
-
-typedef u64_t my_time_t;
-
-struct delay_data
-{
-	int fd;
-	int times_left;
-	char * data;
-	int len;
-	u64_t u64;
-};
-int delay_timer_fd;
-
-int sendto_u64 (int fd,char * buf, int len,int flags, u64_t u64)
-{
-
-	if(is_server)
-	{
-		dup_packet_send_count++;
-	}
-	if(is_server&&random_drop!=0)
-	{
-		if(get_true_random_number()%10000<(u32_t)random_drop)
-		{
-			return 0;
-		}
-	}
-
-	sockaddr_in tmp_sockaddr;
-
-	memset(&tmp_sockaddr,0,sizeof(tmp_sockaddr));
-	tmp_sockaddr.sin_family = AF_INET;
-	tmp_sockaddr.sin_addr.s_addr = (u64 >> 32u);
-
-	tmp_sockaddr.sin_port = htons(uint16_t((u64 << 32u) >> 32u));
-
-	return sendto(fd, buf,
-			len , 0,
-			(struct sockaddr *) &tmp_sockaddr,
-			sizeof(tmp_sockaddr));
-}
-
-int send_fd (int fd,char * buf, int len,int flags)
-{
-	if(is_client)
-	{
-		dup_packet_send_count++;
-	}
-	if(is_client&&random_drop!=0)
-	{
-		if(get_true_random_number()%10000<(u32_t)random_drop)
-		{
-			return 0;
-		}
-	}
-	return send(fd,buf,len,flags);
-}
-
-multimap<my_time_t,delay_data> delay_mp;
-
-int add_to_delay_mp(int fd,int times_left,u32_t delay,char * buf,int len,u64_t u64)
-{
-	if(max_pending_packet!=0&&int(delay_mp.size()) >=max_pending_packet)
-	{
-		mylog(log_warn,"max pending packet reached,ignored\n");
-		return 0;
-	}
-	delay_data tmp;
-	tmp.data = buf;
-	tmp.fd = fd;
-	tmp.times_left = times_left;
-	tmp.len = len;
-	tmp.u64=u64;
-	my_time_t tmp_time=get_current_time_us();
-	tmp_time+=delay*100;
-	delay_mp.insert(make_pair(tmp_time,tmp));
-
-	return 0;
-}
-int add_and_new(int fd,int times_left,u32_t delay,char * buf,int len,u64_t u64)
-{
-	if(times_left<=0) return -1;
-
-	char * str= (char *)malloc(len);
-	memcpy(str,buf,len);
-	add_to_delay_mp(fd,times_left,delay,str,len,u64);
-	return 0;
-}
-
-multimap<u64_t,delay_data> new_delay_mp;
-
-
-
-void handler(int num) {
-	int status;
-	int pid;
-	while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-		if (WIFEXITED(status)) {
-			//printf("The child exit with code %d",WEXITSTATUS(status));
-		}
-	}
-
-}
-void encrypt_0(char * input,int &len,char *key)
-{
-	int i,j;
-	if(key[0]==0) return;
-	for(i=0,j=0;i<len;i++,j++)
-	{
-		if(key[j]==0)j=0;
-		input[i]^=key[j];
-	}
-}
-void decrypt_0(char * input,int &len,char *key)
-{
-
-	int i,j;
-	if(key[0]==0) return;
-	for(i=0,j=0;i<len;i++,j++)
-	{
-		if(key[j]==0)j=0;
-		input[i]^=key[j];
-	}
-}
-int add_seq(char * data,int &data_len )
-{
-	if(data_len<0) return -1;
-	anti_replay_seq_t seq=anti_replay.get_new_seq_for_send();
-	seq=hton64(seq);
-	memcpy(data+data_len,&seq,sizeof(seq));
-	data_len+=sizeof(seq);
-	return 0;
-}
-int remove_seq(char * data,int &data_len)
-{
-	anti_replay_seq_t seq;
-	if(data_len<int(sizeof(seq))) return -1;
-	data_len-=sizeof(seq);
-	memcpy(&seq,data+data_len,sizeof(seq));
-	seq=ntoh64(seq);
-	if(anti_replay.is_vaild(seq)==0)
-	{
-		if(disable_replay_filter==1)
-			return 0;
-		mylog(log_trace,"seq %llx dropped bc of replay-filter\n ",seq);
-		return -1;
-	}
-	packet_recv_count++;
-	return 0;
-}
-int do_obscure(const char * input, int in_len,char *output,int &out_len)
-{
-	//memcpy(output,input,in_len);
-//	out_len=in_len;
-	//return 0;
-
-	int i, j, k;
-	if (in_len > 65535||in_len<0)
-		return -1;
-	int iv_len=iv_min+rand()%(iv_max-iv_min);
-	get_true_random_chars(output,iv_len);
-	memcpy(output+iv_len,input,in_len);
-
-	output[iv_len+in_len]=(uint8_t)iv_len;
-
-	output[iv_len+in_len]^=output[0];
-	output[iv_len+in_len]^=key_string[0];
-
-	for(i=0,j=0,k=1;i<in_len;i++,j++,k++)
-	{
-		if(j==iv_len) j=0;
-		if(key_string[k]==0)k=0;
-		output[iv_len+i]^=output[j];
-		output[iv_len+i]^=key_string[k];
-	}
-
-
-	out_len=iv_len+in_len+1;
-	return 0;
-}
-int de_obscure(const char * input, int in_len,char *output,int &out_len)
-{
-	//memcpy(output,input,in_len);
-	//out_len=in_len;
-	//return 0;
-
-	int i, j, k;
-	if (in_len > 65535||in_len<0)
-	{
-		mylog(log_debug,"in_len > 65535||in_len<0 ,  %d",in_len);
-		return -1;
-	}
-	int iv_len= int ((uint8_t)(input[in_len-1]^input[0]^key_string[0]) );
-	out_len=in_len-1-iv_len;
-	if(out_len<0)
-	{
-		mylog(log_debug,"%d %d\n",in_len,out_len);
-		return -1;
-	}
-	for(i=0,j=0,k=1;i<in_len;i++,j++,k++)
-	{
-		if(j==iv_len) j=0;
-		if(key_string[k]==0)k=0;
-		output[i]=input[iv_len+i]^input[j]^key_string[k];
-
-	}
-	dup_packet_recv_count++;
-	return 0;
-}
-void check_delay_map()
-{
-	if(!delay_mp.empty())
-	{
-		my_time_t current_time;
-
-		multimap<my_time_t,delay_data>::iterator it;
-		while(1)
-		{
-			int ret=0;
-			it=delay_mp.begin();
-			if(it==delay_mp.end()) break;
-
-			current_time=get_current_time_us();
-			if(it->first < current_time||it->first ==current_time)
-			{
-				if (is_client) {
-					if (conn_manager.exist_fd(it->second.fd)) {
-						u64_t u64 = conn_manager.find_u64_by_fd(it->second.fd);
-						if (u64 != it->second.u64) {
-							it->second.times_left = 0; //fd has been deleted and recreated
-							// 偷懒的做法
-						} else {
-							char new_data[buf_len];
-							int new_len = 0;
-							do_obscure(it->second.data, it->second.len,
-									new_data, new_len);
-							ret = send_fd(it->second.fd, new_data, new_len, 0);
-						}
-					} else {
-						it->second.times_left = 0;
-					}
-				} else {
-
-					if (conn_manager.exist_fd(it->second.fd)) {
-						u64_t u64 = conn_manager.find_u64_by_fd(it->second.fd);
-						if (u64 != it->second.u64) {
-							it->second.times_left = 0;//fd has been deleted and recreated
-							// 偷懒的做法
-						} else {
-							char new_data[buf_len];
-							int new_len = 0;
-							do_obscure(it->second.data, it->second.len,
-									new_data, new_len);
-							sendto_u64(local_listen_fd, new_data, new_len, 0,
-									u64);
-						}
-					} else {
-						it->second.times_left = 0;
-					}
-				}
-				if (ret < 0) {
-					mylog(log_debug, "send return %d at @300", ret);
-				}
-
-
-				if(it->second.times_left>1)
-				{
-					//delay_mp.insert(pair<my_time,delay_data>(current_time));
-					add_to_delay_mp(it->second.fd,it->second.times_left-1,random_between(dup_delay_min,dup_delay_max),it->second.data,it->second.len,it->second.u64);
-				}
-				else
-				{
-					free(it->second.data);
-				}
-				delay_mp.erase(it);
-			}
-			else
-			{
-				break;
-			}
-
-		}
-		if(!delay_mp.empty())
-		{
-			itimerspec its;
-			memset(&its.it_interval,0,sizeof(its.it_interval));
-			its.it_value.tv_sec=delay_mp.begin()->first/1000000llu;
-			its.it_value.tv_nsec=(delay_mp.begin()->first%1000000llu)*1000llu;
-			timerfd_settime(delay_timer_fd,TFD_TIMER_ABSTIME,&its,0);
-		}
-	}
-}
-int create_new_udp(int &new_udp_fd)
-{
-	struct sockaddr_in remote_addr_in;
-
-	socklen_t slen = sizeof(sockaddr_in);
-	memset(&remote_addr_in, 0, sizeof(remote_addr_in));
-	remote_addr_in.sin_family = AF_INET;
-	remote_addr_in.sin_port = htons(remote_port);
-	remote_addr_in.sin_addr.s_addr = remote_address_uint32;
-
-	new_udp_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (new_udp_fd < 0) {
-		mylog(log_warn, "create udp_fd error\n");
-		return -1;
-	}
-	setnonblocking(new_udp_fd);
-	set_buf_size(new_udp_fd);
-
-	mylog(log_debug, "created new udp_fd %d\n", new_udp_fd);
-	int ret = connect(new_udp_fd, (struct sockaddr *) &remote_addr_in, slen);
-	if (ret != 0) {
-		mylog(log_warn, "udp fd connect fail\n");
-		close(new_udp_fd);
-		return -1;
-	}
-
-
-	return 0;
-}
-int set_timer(int epollfd,int &timer_fd)
-{
-	int ret;
-	epoll_event ev;
-
-	itimerspec its;
-	memset(&its,0,sizeof(its));
-
-	if((timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_NONBLOCK)) < 0)
-	{
-		mylog(log_fatal,"timer_fd create error\n");
-		myexit(1);
-	}
-	its.it_interval.tv_sec=(timer_interval/1000);
-	its.it_interval.tv_nsec=(timer_interval%1000)*1000ll*1000ll;
-	its.it_value.tv_nsec=1; //imidiately
-	timerfd_settime(timer_fd,0,&its,0);
-
-
-	ev.events = EPOLLIN;
-	ev.data.fd = timer_fd;
-
-	ret=epoll_ctl(epollfd, EPOLL_CTL_ADD, timer_fd, &ev);
-	if (ret < 0) {
-		mylog(log_fatal,"epoll_ctl return %d\n", ret);
-		myexit(-1);
-	}
-	return 0;
-}
-int event_loop()
-{
-	struct sockaddr_in local_me, local_other;
-	local_listen_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	int yes = 1;
-	//setsockopt(local_listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-	set_buf_size(local_listen_fd,4*1024*1024);
-	setnonblocking(local_listen_fd);
+	//setsockopt(udp_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
-	//char data[buf_len];
-	//char *data=data0;
+	struct sockaddr_in local_me={0};
+
 	socklen_t slen = sizeof(sockaddr_in);
-	memset(&local_me, 0, sizeof(local_me));
+	//memset(&local_me, 0, sizeof(local_me));
 	local_me.sin_family = AF_INET;
 	local_me.sin_port = htons(local_port);
-	local_me.sin_addr.s_addr = inet_addr(local_address);
-	if (bind(local_listen_fd, (struct sockaddr*) &local_me, slen) == -1)
-	{
-		mylog(log_fatal,"socket bind error");
+	local_me.sin_addr.s_addr = local_ip_uint32;
+
+	if (bind(local_listen_fd, (struct sockaddr*) &local_me, slen) == -1) {
+		mylog(log_fatal,"socket bind error\n");
+		//perror("socket bind error");
 		myexit(1);
 	}
+	setnonblocking(local_listen_fd);
+    set_buf_size(local_listen_fd,socket_buf_size);
 
-	int epollfd = epoll_create1(0);
-	const int max_events = 4096;
-	struct epoll_event ev, events[max_events];
-	if (epollfd < 0)
-	{
-		mylog(log_fatal,"epoll created return %d\n", epollfd);
-		myexit(-1);
+    mylog(log_debug,"local_listen_fd=%d\n,",local_listen_fd);
+
+	return 0;
+}
+int new_connected_socket(int &fd,u32_t ip,int port)
+{
+	char ip_port[40];
+	sprintf(ip_port,"%s:%d",my_ntoa(ip),port);
+
+	struct sockaddr_in remote_addr_in = { 0 };
+
+	socklen_t slen = sizeof(sockaddr_in);
+	//memset(&remote_addr_in, 0, sizeof(remote_addr_in));
+	remote_addr_in.sin_family = AF_INET;
+	remote_addr_in.sin_port = htons(port);
+	remote_addr_in.sin_addr.s_addr = ip;
+
+	fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (fd < 0) {
+		mylog(log_warn, "[%s]create udp_fd error\n", ip_port);
+		return -1;
 	}
-	ev.events = EPOLLIN;
-	ev.data.fd = local_listen_fd;
-	int ret = epoll_ctl(epollfd, EPOLL_CTL_ADD, local_listen_fd, &ev);
+	setnonblocking(fd);
+	set_buf_size(fd, socket_buf_size);
 
-	if(ret!=0)
-	{
-		mylog(log_fatal,"epoll created return %d\n", epollfd);
-		myexit(-1);
+	mylog(log_debug, "[%s]created new udp_fd %d\n", ip_port, fd);
+	int ret = connect(fd, (struct sockaddr *) &remote_addr_in, slen);
+	if (ret != 0) {
+		mylog(log_warn, "[%s]fd connect fail\n",ip_port);
+		close(fd);
+		return -1;
 	}
-	int clear_timer_fd=-1;
-	set_timer(epollfd,clear_timer_fd);
+	return 0;
+}
+int delay_send(my_time_t delay,const dest_t &dest,char *data,int len)
+{
+	//int rand=random()%100;
+	//mylog(log_info,"rand = %d\n",rand);
 
-
-
-	if ((delay_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK)) < 0)
-	{
-		mylog(log_fatal,"timer_fd create error");
-		myexit(1);
-	}
-	ev.events = EPOLLIN;
-	ev.data.fd = delay_timer_fd;
-
-	itimerspec zero_its;
-	memset(&zero_its, 0, sizeof(zero_its));
-
-	timerfd_settime(delay_timer_fd, TFD_TIMER_ABSTIME, &zero_its, 0);
-	epoll_ctl(epollfd, EPOLL_CTL_ADD, delay_timer_fd, &ev);
-	if (ret < 0)
-	{
-		mylog(log_fatal,"epoll_ctl return %d\n", ret);
-		myexit(-1);
-	}
-
-	for (;;)
-	{
-		int nfds = epoll_wait(epollfd, events, max_events, 180 * 1000); //3mins
-		if (nfds < 0)
-		{
-			mylog(log_fatal,"epoll_wait return %d\n", nfds);
-			myexit(-1);
+	if (dest.cook&&random_drop != 0) {
+		if (get_true_random_number() % 10000 < (u32_t) random_drop) {
+			return 0;
 		}
-		int n;
-		int clear_triggered=0;
-		for (n = 0; n < nfds; ++n)
+	}
+	return delay_manager.add(delay,dest,data,len);;
+}
+int from_normal_to_fec(conn_info_t & conn_info,char *data,int len,int & out_n,char **&out_arr,int *&out_len,my_time_t *&out_delay)
+{
+
+	static my_time_t out_delay_buf[max_fec_packet_num+100]={0};
+	//static int out_len_buf[max_fec_packet_num+100]={0};
+	//static int counter=0;
+	out_delay=out_delay_buf;
+	//out_len=out_len_buf;
+	inner_stat_t &inner_stat=conn_info.stat.normal_to_fec;
+	if(disable_fec)
+	{
+		assert(data!=0);
+		inner_stat.input_packet_num++;
+		inner_stat.input_packet_size+=len;
+		inner_stat.output_packet_num++;
+		inner_stat.output_packet_size+=len;
+
+		if(data==0) return 0;
+		out_n=1;
+		static char *data_static;
+		data_static=data;
+		static int len_static;
+		len_static=len;
+		out_arr=&data_static;
+		out_len=&len_static;
+		out_delay[0]=0;
+
+	}
+	else
+	{
+		if(data!=0)
 		{
-			if (events[n].data.fd == local_listen_fd) //data income from local end
+			inner_stat.input_packet_num++;
+			inner_stat.input_packet_size+=len;
+		}
+		//counter++;
+
+		conn_info.fec_encode_manager.input(data,len);
+
+		//if(counter%5==0)
+			//conn_info.fec_encode_manager.input(0,0);
+
+		//int n;
+		//char **s_arr;
+		//int s_len;
+
+
+		conn_info.fec_encode_manager.output(out_n,out_arr,out_len);
+
+		if(out_n>0)
+		{
+			my_time_t common_latency=0;
+			my_time_t first_packet_time=conn_info.fec_encode_manager.get_first_packet_time();
+
+			if(fix_latency==1&&conn_info.fec_encode_manager.get_type()==0)
 			{
-
-				char data[buf_len];
-				int data_len;
-
-				slen = sizeof(sockaddr_in);
-				if ((data_len = recvfrom(local_listen_fd, data, max_data_len, 0,
-						(struct sockaddr *) &local_other, &slen)) == -1) //<--first packet from a new ip:port turple
+				my_time_t current_time=get_current_time_us();
+				my_time_t tmp;
+				assert(first_packet_time!=0);
+				//mylog(log_info,"current_time=%llu first_packlet_time=%llu   fec_pending_time=%llu\n",current_time,first_packet_time,(my_time_t)fec_pending_time);
+				if((my_time_t)fec_pending_time >=(current_time - first_packet_time))
 				{
-
-					mylog(log_error,"recv_from error,errno %s,this shouldnt happen,but lets try to pretend it didnt happen",strerror(errno));
-					//myexit(1);
-					continue;
-				}
-				mylog(log_trace, "received data from listen fd,%s:%d, len=%d\n", my_ntoa(local_other.sin_addr.s_addr),ntohs(local_other.sin_port),data_len);
-				if(data_len>mtu_warn)
-				{
-					mylog(log_warn,"huge packet,data len=%d (>%d).strongly suggested to set a smaller mtu at upper level,to get rid of this warn\n ",data_len,mtu_warn);
-				}
-				data[data_len] = 0; //for easier debug
-				u64_t u64=pack_u64(local_other.sin_addr.s_addr,ntohs(local_other.sin_port));
-
-				if(!conn_manager.exist_u64(u64))
-				{
-
-					if(int(conn_manager.fd_to_u64.size())>=max_conv_num)
-					{
-						mylog(log_info,"new connection from %s:%d ,but ignored,bc of max_conv_num reached\n",my_ntoa(local_other.sin_addr.s_addr),ntohs(local_other.sin_port));
-						continue;
-					}
-					int new_udp_fd;
-					if(create_new_udp(new_udp_fd)!=0)
-					{
-						mylog(log_info,"new connection from %s:%d ,but create udp fd failed\n",my_ntoa(local_other.sin_addr.s_addr),ntohs(local_other.sin_port));
-						continue;
-					}
-					struct epoll_event ev;
-
-					mylog(log_trace, "u64: %lld\n", u64);
-					ev.events = EPOLLIN;
-
-					ev.data.fd = new_udp_fd;
-
-					ret = epoll_ctl(epollfd, EPOLL_CTL_ADD, new_udp_fd, &ev);
-					if (ret != 0) {
-						mylog(log_info,"new connection from %s:%d ,but add to epoll failed\n",my_ntoa(local_other.sin_addr.s_addr),ntohs(local_other.sin_port));
-						close(new_udp_fd);
-						continue;
-					}
-					mylog(log_info,"new connection from %s:%d ,created new udp fd %d\n",my_ntoa(local_other.sin_addr.s_addr),ntohs(local_other.sin_port),new_udp_fd);
-					conn_manager.insert_fd(new_udp_fd,u64);
-				}
-				int new_udp_fd=conn_manager.find_fd_by_u64(u64);
-				conn_manager.update_active_time(new_udp_fd);
-				int ret;
-				if(is_client)
-				{
-					add_seq(data,data_len);
-					if(jitter_max==0)
-					{
-						char new_data[buf_len];
-						int new_len=0;
-						do_obscure(data, data_len, new_data, new_len);
-						ret = send_fd(new_udp_fd, new_data,new_len, 0);
-						if (ret < 0) {
-							mylog(log_warn, "send returned %d ,errno:%s\n", ret,strerror(errno));
-						}
-						add_and_new(new_udp_fd, dup_num - 1,random_between(dup_delay_min,dup_delay_max), data, data_len,u64);
-					}
-					else
-					{
-						add_and_new(new_udp_fd, dup_num,random_between(jitter_min,jitter_max), data, data_len,u64);
-					}
-					packet_send_count++;
+					tmp=(my_time_t)fec_pending_time-(current_time - first_packet_time);
+					//mylog(log_info,"tmp=%llu\n",tmp);
 				}
 				else
 				{
-					char new_data[buf_len];
-					int new_len;
-
-					if (de_obscure(data, data_len, new_data, new_len) != 0) {
-						mylog(log_trace,"de_obscure failed \n");
-						continue;
-					}
-					//dup_packet_recv_count++;
-					if (remove_seq(new_data, new_len) != 0) {
-						mylog(log_trace,"remove_seq failed \n");
-						continue;
-					}
-					//packet_recv_count++;
-					ret = send_fd(new_udp_fd, new_data,new_len, 0);
-					if (ret < 0) {
-						mylog(log_warn, "send returned %d,%s\n", ret,strerror(errno));
-						//perror("what happened????");
-					}
+					tmp=0;
+					//mylog(log_info,"0\n");
 				}
-
-
+				common_latency+=tmp;
 			}
-			else if(events[n].data.fd == clear_timer_fd)
+
+			common_latency+=random_between(jitter_min,jitter_max);
+
+			out_delay_buf[0]=common_latency;
+
+			for(int i=1;i<out_n;i++)
 			{
-				clear_triggered=1;
-				if(report_interval!=0 &&get_current_time()-last_report_time>u64_t(report_interval)*1000)
-				{
-					last_report_time=get_current_time();
-					if(is_client)
-						mylog(log_info,"client-->server: %llu,%llu(include dup); server-->client %llu,%lld(include dup)\n",packet_send_count,
-							dup_packet_send_count,packet_recv_count,dup_packet_recv_count);
-					else
-						mylog(log_info,"client-->server: %llu,%llu(include dup); server-->client %llu,%lld(include dup)\n",packet_recv_count,dup_packet_recv_count,packet_send_count,
-								dup_packet_send_count);
-				}
+				out_delay_buf[i]=out_delay_buf[i-1]+ (my_time_t)( random_between(output_interval_min,output_interval_max)/(out_n-1)  );
 			}
-			else if (events[n].data.fd == delay_timer_fd)
+		}
+
+	}
+
+	mylog(log_trace,"from_normal_to_fec input_len=%d,output_n=%d\n",len,out_n);
+
+	if(out_n>0)
+	{
+		log_bare(log_trace,"seq= %u ",read_u32(out_arr[0]));
+	}
+	for(int i=0;i<out_n;i++)
+	{
+		inner_stat.output_packet_num++;
+		inner_stat.output_packet_size+=out_len[i];
+
+		log_bare(log_trace,"%d ",out_len[i]);
+
+	}
+
+	log_bare(log_trace,"\n");
+	//for(int i=0;i<n;i++)
+	//{
+		//delay_send(0,dest,s_arr[i],s_len);
+	//}
+	//delay_send(0,dest,data,len);
+	//delay_send(1000*1000,dest,data,len);
+	return 0;
+}
+int from_fec_to_normal(conn_info_t & conn_info,char *data,int len,int & out_n,char **&out_arr,int *&out_len,my_time_t *&out_delay)
+{
+	static my_time_t out_delay_buf[max_blob_packet_num+100]={0};
+	out_delay=out_delay_buf;
+	inner_stat_t &inner_stat=conn_info.stat.fec_to_normal;
+	if(disable_fec)
+	{
+		assert(data!=0);
+		inner_stat.input_packet_num++;
+		inner_stat.input_packet_size+=len;
+		inner_stat.output_packet_num++;
+		inner_stat.output_packet_size+=len;
+
+		if(data==0) return 0;
+		out_n=1;
+		static char *data_static;
+		data_static=data;
+		static int len_static;
+		len_static=len;
+		out_arr=&data_static;
+		out_len=&len_static;
+		out_delay[0]=0;
+	}
+	else
+	{
+
+		if(data!=0)
+		{
+			inner_stat.input_packet_num++;
+			inner_stat.input_packet_size+=len;
+		}
+
+		conn_info.fec_decode_manager.input(data,len);
+
+		//int n;char ** s_arr;int* len_arr;
+		conn_info.fec_decode_manager.output(out_n,out_arr,out_len);
+		for(int i=0;i<out_n;i++)
+		{
+			out_delay_buf[i]=0;
+
+			inner_stat.output_packet_num++;
+			inner_stat.output_packet_size+=out_len[i];
+		}
+
+
+	}
+
+	mylog(log_trace,"from_fec_to_normal input_len=%d,output_n=%d,input_seq=%u\n",len,out_n,read_u32(data));
+
+
+//	printf("<n:%d>",n);
+	/*
+	for(int i=0;i<n;i++)
+	{
+		delay_send(0,dest,s_arr[i],len_arr[i]);
+		//s_arr[i][len_arr[i]]=0;
+		//printf("<%s>\n",s_arr[i]);
+	}*/
+	//my_send(dest,data,len);
+	return 0;
+}
+int client_event_loop()
+{
+	//char buf[buf_len];
+	int i, j, k;int ret;
+	int yes = 1;
+	int epoll_fd;
+	int remote_fd;
+	fd64_t remote_fd64;
+
+    conn_info_t *conn_info_p=new conn_info_t;
+    conn_info_t &conn_info=*conn_info_p;  //huge size of conn_info,do not allocate on stack
+    //conn_info.conv_manager.reserve();
+	conn_info.fec_encode_manager.re_init(fec_data_num,fec_redundant_num,fec_mtu,fec_pending_num,fec_pending_time,fec_type);
+
+	init_listen_socket();
+
+	epoll_fd = epoll_create1(0);
+	assert(epoll_fd>0);
+
+	const int max_events = 4096;
+	struct epoll_event ev, events[max_events];
+	if (epoll_fd < 0) {
+		mylog(log_fatal,"epoll return %d\n", epoll_fd);
+		myexit(-1);
+	}
+
+	ev.events = EPOLLIN;
+	ev.data.u64 = local_listen_fd;
+	ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, local_listen_fd, &ev);
+	if (ret!=0) {
+		mylog(log_fatal,"add  udp_listen_fd error\n");
+		myexit(-1);
+	}
+
+	assert(new_connected_socket(remote_fd,remote_ip_uint32,remote_port)==0);
+	remote_fd64=fd_manager.create(remote_fd);
+
+	mylog(log_debug,"remote_fd64=%llu\n",remote_fd64);
+
+	ev.events = EPOLLIN;
+	ev.data.u64 = remote_fd64;
+
+	ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, remote_fd, &ev);
+	if (ret!= 0) {
+		mylog(log_fatal,"add raw_fd error\n");
+		myexit(-1);
+	}
+
+	ev.events = EPOLLIN;
+	ev.data.u64 = delay_manager.get_timer_fd();
+
+	mylog(log_debug,"delay_manager.get_timer_fd()=%d\n",delay_manager.get_timer_fd());
+	ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, delay_manager.get_timer_fd(), &ev);
+	if (ret!= 0) {
+		mylog(log_fatal,"add delay_manager.get_timer_fd() error\n");
+		myexit(-1);
+	}
+
+	u64_t fd64=conn_info.fec_encode_manager.get_timer_fd64();
+	ev.events = EPOLLIN;
+	ev.data.u64 = fd64;
+
+	mylog(log_debug,"conn_info.fec_encode_manager.get_timer_fd64()=%llu\n",conn_info.fec_encode_manager.get_timer_fd64());
+	ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd_manager.to_fd(fd64), &ev);
+	if (ret!= 0) {
+		mylog(log_fatal,"add fec_encode_manager.get_timer_fd64() error\n");
+		myexit(-1);
+	}
+
+	//my_timer_t timer;
+	conn_info.timer.add_fd_to_epoll(epoll_fd);
+	conn_info.timer.set_timer_repeat_us(timer_interval*1000);
+
+	mylog(log_debug,"conn_info.timer.get_timer_fd()=%d\n",conn_info.timer.get_timer_fd());
+
+
+
+	while(1)////////////////////////
+	{
+		if(about_to_exit) myexit(0);
+
+		int nfds = epoll_wait(epoll_fd, events, max_events, 180 * 1000);
+		if (nfds < 0) {  //allow zero
+			if(errno==EINTR  )
+			{
+				mylog(log_info,"epoll interrupted by signal\n");
+				myexit(0);
+			}
+			else
+			{
+				mylog(log_fatal,"epoll_wait return %d\n", nfds);
+				myexit(-1);
+			}
+		}
+		int idx;
+		for (idx = 0; idx < nfds; ++idx) {
+			if(events[idx].data.u64==(u64_t)conn_info.timer.get_timer_fd())
 			{
 				uint64_t value;
-				read(delay_timer_fd, &value, 8);
+				read(conn_info.timer.get_timer_fd(), &value, 8);
+				conn_info.conv_manager.clear_inactive();
+				mylog(log_trace,"events[idx].data.u64==(u64_t)conn_info.timer.get_timer_fd()\n");
+
+				conn_info.stat.report_as_client();
+
+				if(debug_force_flush_fec)
+				{
+				int  out_n;char **out_arr;int *out_len;my_time_t *out_delay;
+				dest_t dest;
+				dest.type=type_fd64;
+				dest.inner.fd64=remote_fd64;
+				dest.cook=1;
+				from_normal_to_fec(conn_info,0,0,out_n,out_arr,out_len,out_delay);
+				for(int i=0;i<out_n;i++)
+				{
+					delay_send(out_delay[i],dest,out_arr[i],out_len[i]);
+				}
+				}
+			}
+			else if (events[idx].data.u64 == (u64_t)local_listen_fd||events[idx].data.u64 == conn_info.fec_encode_manager.get_timer_fd64())
+			{
+				char data[buf_len];
+				int data_len;
+				ip_port_t ip_port;
+				u32_t conv;
+				int  out_n;char **out_arr;int *out_len;my_time_t *out_delay;
+				dest_t dest;
+				dest.type=type_fd64;
+				dest.inner.fd64=remote_fd64;
+				dest.cook=1;
+
+				if(events[idx].data.u64 == conn_info.fec_encode_manager.get_timer_fd64())
+				{
+					mylog(log_trace,"events[idx].data.u64 == conn_info.fec_encode_manager.get_timer_fd64()\n");
+
+					//mylog(log_info,"timer!!!\n");
+					uint64_t value;
+					if(!fd_manager.exist(fd64))   //fd64 has been closed
+					{
+						mylog(log_trace,"!fd_manager.exist(fd64)");
+						continue;
+					}
+					if((ret=read(fd_manager.to_fd(fd64), &value, 8))!=8)
+					{
+						mylog(log_trace,"(ret=read(fd_manager.to_fd(fd64), &value, 8))!=8,ret=%d\n",ret);
+						continue;
+					}
+					if(value==0)
+					{
+						mylog(log_debug,"value==0\n");
+						continue;
+					}
+					assert(value==1);
+					from_normal_to_fec(conn_info,0,0,out_n,out_arr,out_len,out_delay);
+					//from_normal_to_fec(conn_info,0,0,out_n,out_arr,out_len,out_delay);
+				}
+				else//events[idx].data.u64 == (u64_t)local_listen_fd
+				{
+					mylog(log_trace,"events[idx].data.u64 == (u64_t)local_listen_fd\n");
+					struct sockaddr_in udp_new_addr_in={0};
+					socklen_t udp_new_addr_len = sizeof(sockaddr_in);
+					if ((data_len = recvfrom(local_listen_fd, data, max_data_len, 0,
+							(struct sockaddr *) &udp_new_addr_in, &udp_new_addr_len)) == -1) {
+						mylog(log_error,"recv_from error,this shouldnt happen at client\n");
+						myexit(1);
+					};
+
+					if(!disable_mtu_warn&&data_len>=mtu_warn)
+					{
+						mylog(log_warn,"huge packet,data len=%d (>=%d).strongly suggested to set a smaller mtu at upper level,to get rid of this warn\n ",data_len,mtu_warn);
+					}
+					mylog(log_trace,"Received packet from %s:%d,len: %d\n", inet_ntoa(udp_new_addr_in.sin_addr),
+							ntohs(udp_new_addr_in.sin_port),data_len);
+
+					ip_port.ip=udp_new_addr_in.sin_addr.s_addr;
+					ip_port.port=ntohs(udp_new_addr_in.sin_port);
+
+					u64_t u64=ip_port.to_u64();
+
+					if(!conn_info.conv_manager.is_u64_used(u64))
+					{
+						if(conn_info.conv_manager.get_size() >=max_conv_num)
+						{
+							mylog(log_warn,"ignored new udp connect bc max_conv_num exceed\n");
+							continue;
+						}
+						conv=conn_info.conv_manager.get_new_conv();
+						conn_info.conv_manager.insert_conv(conv,u64);
+						mylog(log_info,"new packet from %s:%d,conv_id=%x\n",inet_ntoa(udp_new_addr_in.sin_addr),ntohs(udp_new_addr_in.sin_port),conv);
+					}
+					else
+					{
+						conv=conn_info.conv_manager.find_conv_by_u64(u64);
+						mylog(log_trace,"conv=%d\n",conv);
+					}
+					conn_info.conv_manager.update_active_time(conv);
+					char * new_data;
+					int new_len;
+					put_conv(conv,data,data_len,new_data,new_len);
+
+
+					mylog(log_trace,"data_len=%d new_len=%d\n",data_len,new_len);
+					//dest.conv=conv;
+					from_normal_to_fec(conn_info,new_data,new_len,out_n,out_arr,out_len,out_delay);
+
+				}
+				mylog(log_trace,"out_n=%d\n",out_n);
+				for(int i=0;i<out_n;i++)
+				{
+					delay_send(out_delay[i],dest,out_arr[i],out_len[i]);
+				}
+				//my_send(dest,data,data_len);
+			}
+		    else if (events[idx].data.u64 == (u64_t)delay_manager.get_timer_fd()) {
+				uint64_t value;
+				read(delay_manager.get_timer_fd(), &value, 8);
+				mylog(log_trace,"events[idx].data.u64 == (u64_t)delay_manager.get_timer_fd()\n");
 				//printf("<timerfd_triggered, %d>",delay_mp.size());
 				//fflush(stdout);
 			}
-			else
+			else if(events[idx].data.u64>u32_t(-1) )
 			{
-				int udp_fd=events[n].data.fd;
-				if(!conn_manager.exist_fd(udp_fd)) continue;
-
 				char data[buf_len];
-				int data_len =recv(udp_fd,data,max_data_len,0);
-				mylog(log_trace, "received data from udp fd %d, len=%d\n", udp_fd,data_len);
+				if(!fd_manager.exist(events[idx].data.u64))   //fd64 has been closed
+				{
+					mylog(log_trace,"!fd_manager.exist(events[idx].data.u64)");
+					continue;
+				}
+				assert(events[idx].data.u64==remote_fd64);
+				int fd=fd_manager.to_fd(remote_fd64);
+				int data_len =recv(fd,data,max_data_len,0);
+				mylog(log_trace, "received data from udp fd %d, len=%d\n", remote_fd,data_len);
 				if(data_len<0)
 				{
 					if(errno==ECONNREFUSED)
 					{
 						//conn_manager.clear_list.push_back(udp_fd);
-						mylog(log_debug, "recv failed %d ,udp_fd%d,errno:%s\n", data_len,udp_fd,strerror(errno));
+						mylog(log_debug, "recv failed %d ,udp_fd%d,errno:%s\n", data_len,remote_fd,strerror(errno));
 					}
 
-					mylog(log_warn, "recv failed %d ,udp_fd%d,errno:%s\n", data_len,udp_fd,strerror(errno));
+					mylog(log_warn, "recv failed %d ,udp_fd%d,errno:%s\n", data_len,remote_fd,strerror(errno));
 					continue;
 				}
-				if(data_len>mtu_warn)
+				if(!disable_mtu_warn&&data_len>mtu_warn)
 				{
 					mylog(log_warn,"huge packet,data len=%d (>%d).strongly suggested to set a smaller mtu at upper level,to get rid of this warn\n ",data_len,mtu_warn);
 				}
 
-				assert(conn_manager.exist_fd(udp_fd));
-
-				conn_manager.update_active_time(udp_fd);
-
-				u64_t u64=conn_manager.find_u64_by_fd(udp_fd);
-
-				if(is_client)
+				if(de_cook(data,data_len)!=0)
 				{
-					char new_data[buf_len];
+					mylog(log_debug,"de_cook error");
+					continue;
+				}
+
+				int  out_n;char **out_arr;int *out_len;my_time_t *out_delay;
+				from_fec_to_normal(conn_info,data,data_len,out_n,out_arr,out_len,out_delay);
+
+				mylog(log_trace,"out_n=%d\n",out_n);
+
+				for(int i=0;i<out_n;i++)
+				{
+					u32_t conv;
+					char *new_data;
 					int new_len;
-					if (de_obscure(data, data_len, new_data, new_len) != 0) {
-						mylog(log_debug,"data_len=%d \n",data_len);
+					if(get_conv(conv,out_arr[i],out_len[i],new_data,new_len)!=0)
+					{
+						mylog(log_debug,"get_conv(conv,out_arr[i],out_len[i],new_data,new_len)!=0");
+						continue;
+					}
+					if(!conn_info.conv_manager.is_conv_used(conv))
+					{
+						mylog(log_trace,"!conn_info.conv_manager.is_conv_used(conv)");
+					}
+
+					conn_info.conv_manager.update_active_time(conv);
+
+					u64_t u64=conn_info.conv_manager.find_u64_by_conv(conv);
+					dest_t dest;
+					dest.inner.ip_port.from_u64(u64);
+					dest.type=type_ip_port;
+					//dest.conv=conv;
+
+					delay_send(out_delay[i],dest,new_data,new_len);
+				}
+				//mylog(log_trace,"[%s] send packet\n",dest.inner.ip_port.to_s());
+			}
+			else
+			{
+				mylog(log_fatal,"unknown fd,this should never happen\n");
+				myexit(-1);
+			}
+		}
+		delay_manager.check();
+	}
+	return 0;
+}
+
+int server_event_loop()
+{
+	//char buf[buf_len];
+	int i, j, k;int ret;
+	int yes = 1;
+	int epoll_fd;
+	int remote_fd;
+
+//    conn_info_t conn_info;
+
+	init_listen_socket();
+
+	epoll_fd = epoll_create1(0);
+	assert(epoll_fd>0);
+
+	const int max_events = 4096;
+	struct epoll_event ev, events[max_events];
+	if (epoll_fd < 0) {
+		mylog(log_fatal,"epoll return %d\n", epoll_fd);
+		myexit(-1);
+	}
+
+	ev.events = EPOLLIN;
+	ev.data.u64 = local_listen_fd;
+	ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, local_listen_fd, &ev);
+	if (ret!=0) {
+		mylog(log_fatal,"add  udp_listen_fd error\n");
+		myexit(-1);
+	}
+
+	ev.events = EPOLLIN;
+	ev.data.u64 = delay_manager.get_timer_fd();
+	ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, delay_manager.get_timer_fd(), &ev);
+	if (ret!= 0) {
+		mylog(log_fatal,"add delay_manager.get_timer_fd() error\n");
+		myexit(-1);
+	}
+
+	mylog(log_debug," delay_manager.get_timer_fd() =%d\n", delay_manager.get_timer_fd());
+
+	mylog(log_info,"now listening at %s:%d\n",my_ntoa(local_ip_uint32),local_port);
+
+	my_timer_t timer;
+	timer.add_fd_to_epoll(epoll_fd);
+	timer.set_timer_repeat_us(timer_interval*1000);
+
+
+
+	mylog(log_debug," timer.get_timer_fd() =%d\n",timer.get_timer_fd());
+
+	while(1)////////////////////////
+	{
+
+		if(about_to_exit) myexit(0);
+
+		int nfds = epoll_wait(epoll_fd, events, max_events, 180 * 1000);
+		if (nfds < 0) {  //allow zero
+			if(errno==EINTR  )
+			{
+				mylog(log_info,"epoll interrupted by signal\n");
+				myexit(0);
+			}
+			else
+			{
+				mylog(log_fatal,"epoll_wait return %d\n", nfds);
+				myexit(-1);
+			}
+		}
+		int idx;
+		for (idx = 0; idx < nfds; ++idx)
+		{
+			/*
+			if ((events[idx].data.u64 ) == (u64_t)timer_fd)
+			{
+				conn_manager.clear_inactive();
+				u64_t dummy;
+				read(timer_fd, &dummy, 8);
+				//current_time_rough=get_current_time();
+			}
+			else */
+			if(events[idx].data.u64==(u64_t)timer.get_timer_fd())
+			{
+				uint64_t value;
+				read(timer.get_timer_fd(), &value, 8);
+				conn_manager.clear_inactive();
+				mylog(log_trace,"events[idx].data.u64==(u64_t)timer.get_timer_fd()\n");
+				//conn_info.conv_manager.clear_inactive();
+			}
+			else if (events[idx].data.u64 == (u64_t)local_listen_fd)
+			{
+
+				mylog(log_trace,"events[idx].data.u64 == (u64_t)local_listen_fd\n");
+				//int recv_len;
+				char data[buf_len];
+				int data_len;
+				struct sockaddr_in udp_new_addr_in={0};
+				socklen_t udp_new_addr_len = sizeof(sockaddr_in);
+				if ((data_len = recvfrom(local_listen_fd, data, max_data_len, 0,
+						(struct sockaddr *) &udp_new_addr_in, &udp_new_addr_len)) == -1) {
+					mylog(log_error,"recv_from error,this shouldnt happen at client\n");
+					myexit(1);
+				};
+				mylog(log_trace,"Received packet from %s:%d,len: %d\n", inet_ntoa(udp_new_addr_in.sin_addr),
+						ntohs(udp_new_addr_in.sin_port),data_len);
+
+				if(!disable_mtu_warn&&data_len>=mtu_warn)///////////////////////delete this for type 0 in furture
+				{
+					mylog(log_warn,"huge packet,data len=%d (>=%d).strongly suggested to set a smaller mtu at upper level,to get rid of this warn\n ",data_len,mtu_warn);
+				}
+
+
+				if(de_cook(data,data_len)!=0)
+				{
+					mylog(log_debug,"de_cook error");
+					continue;
+				}
+
+
+				ip_port_t ip_port;
+				ip_port.ip=udp_new_addr_in.sin_addr.s_addr;
+				ip_port.port=ntohs(udp_new_addr_in.sin_port);
+				mylog(log_trace,"ip_port= %s\n",ip_port.to_s());
+				if(!conn_manager.exist(ip_port))
+				{
+					if(conn_manager.mp.size() >=max_conn_num)
+					{
+						mylog(log_warn,"new connection %s ignored bc max_conn_num exceed\n",ip_port.to_s());
 						continue;
 					}
 
-					//dup_packet_recv_count++;
-					if (remove_seq(new_data, new_len) != 0) {
-						mylog(log_debug,"remove_seq error \n");
+					conn_manager.insert(ip_port);
+					conn_info_t &conn_info=conn_manager.find(ip_port);
+					conn_info.fec_encode_manager.re_init(fec_data_num,fec_redundant_num,fec_mtu,fec_pending_num,fec_pending_time,fec_type);
+					//conn_info.conv_manager.reserve();  //already reserved in constructor
+
+					u64_t fec_fd64=conn_info.fec_encode_manager.get_timer_fd64();
+					mylog(log_debug,"fec_fd64=%llu\n",fec_fd64);
+					ev.events = EPOLLIN;
+					ev.data.u64 = fec_fd64;
+					ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd_manager.to_fd(fec_fd64), &ev);
+
+					fd_manager.get_info(fec_fd64).ip_port=ip_port;
+
+					conn_info.timer.add_fd64_to_epoll(epoll_fd);
+					conn_info.timer.set_timer_repeat_us(timer_interval*1000);
+
+					mylog(log_debug,"conn_info.timer.get_timer_fd64()=%llu\n",conn_info.timer.get_timer_fd64());
+
+					u64_t timer_fd64=conn_info.timer.get_timer_fd64();
+					fd_manager.get_info(timer_fd64).ip_port=ip_port;
+
+					mylog(log_info,"new connection from %s\n",ip_port.to_s());
+
+				}
+				conn_info_t &conn_info=conn_manager.find(ip_port);
+
+				conn_info.update_active_time();
+				int  out_n;char **out_arr;int *out_len;my_time_t *out_delay;
+				from_fec_to_normal(conn_info,data,data_len,out_n,out_arr,out_len,out_delay);
+
+				mylog(log_trace,"out_n= %d\n",out_n);
+				for(int i=0;i<out_n;i++)
+				{
+					u32_t conv;
+					char *new_data;
+					int new_len;
+					if(get_conv(conv,out_arr[i],out_len[i],new_data,new_len)!=0)
+					{
+						mylog(log_debug,"get_conv failed");
 						continue;
 					}
-					//packet_recv_count++;
-					ret = sendto_u64(local_listen_fd, new_data,
-							new_len , 0,u64);
-					if (ret < 0) {
-						mylog(log_warn, "sento returned %d,%s\n", ret,strerror(errno));
-						//perror("ret<0");
+
+					/*
+					id_t tmp_conv_id;
+					memcpy(&tmp_conv_id,&data_[0],sizeof(tmp_conv_id));
+					tmp_conv_id=ntohl(tmp_conv_id);*/
+
+					if (!conn_info.conv_manager.is_conv_used(conv))
+					{
+						if(conn_info.conv_manager.get_size() >=max_conv_num)
+						{
+							mylog(log_warn,"ignored new udp connect bc max_conv_num exceed\n");
+							continue;
+						}
+
+						int new_udp_fd;
+						ret=new_connected_socket(new_udp_fd,remote_ip_uint32,remote_port);
+
+						if (ret != 0) {
+							mylog(log_warn, "[%s]new_connected_socket failed\n",ip_port.to_s());
+							continue;
+						}
+
+						fd64_t fd64 = fd_manager.create(new_udp_fd);
+						ev.events = EPOLLIN;
+						ev.data.u64 = fd64;
+						ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_udp_fd, &ev);
+
+						conn_info.conv_manager.insert_conv(conv, fd64);
+						fd_manager.get_info(fd64).ip_port=ip_port;
+
+
+						mylog(log_info,"[%s]new conv %x,fd %d created,fd64=%llu\n",ip_port.to_s(),conv,new_udp_fd,fd64);
+						//assert(!conn_manager.exist_fd64(fd64));
+
+						//conn_manager.insert_fd64(fd64,ip_port);
 					}
+					conn_info.conv_manager.update_active_time(conv);
+					fd64_t fd64= conn_info.conv_manager.find_u64_by_conv(conv);
+					//int fd=fd_manager.fd64_to_fd(fd64);
+					dest_t dest;
+					dest.type=type_fd64;
+					dest.inner.fd64=fd64;
+					//dest.conv=conv;
+					delay_send(out_delay[i],dest,new_data,new_len);
+				}
+			}
+		    else if (events[idx].data.u64 == (u64_t)delay_manager.get_timer_fd()) {
+				uint64_t value;
+				read(delay_manager.get_timer_fd(), &value, 8);
+				mylog(log_trace,"events[idx].data.u64 == (u64_t)delay_manager.get_timer_fd()\n");
+			}
+			else if (events[idx].data.u64 >u32_t(-1))
+			{
+				char data[buf_len];
+				int data_len;
+				u32_t conv;
+				fd64_t fd64=events[idx].data.u64;
+				mylog(log_trace,"events[idx].data.u64 >u32_t(-1),%llu\n",(u64_t)events[idx].data.u64);
+				if(!fd_manager.exist(fd64))   //fd64 has been closed
+				{
+					mylog(log_trace,"!fd_manager.exist(fd64)\n");
+					continue;
+				}
+
+				assert(fd_manager.exist_info(fd64));
+				ip_port_t ip_port=fd_manager.get_info(fd64).ip_port;
+				assert(conn_manager.exist(ip_port));
+
+				conn_info_t &conn_info=conn_manager.find(ip_port);
+				//conn_info.update_active_time(); //cant put it here
+
+				int  out_n=-2;char **out_arr;int *out_len;my_time_t *out_delay;
+				dest_t dest;
+				dest.type=type_ip_port;
+				//dest.conv=conv;
+				dest.inner.ip_port=ip_port;
+				dest.cook=1;
+
+				if(fd64==conn_info.fec_encode_manager.get_timer_fd64())
+				{
+					//mylog(log_infol,"timer!!!\n");
+					uint64_t value;
+					if((ret=read(fd_manager.to_fd(fd64), &value, 8))!=8)
+					{
+						mylog(log_trace,"fd_manager.to_fd(fd64), &value, 8)!=8 ,%d\n",ret);
+						continue;
+					}
+					if(value==0)
+					{
+						mylog(log_trace,"value==0\n");
+						continue;
+					}
+					assert(value==1);
+					from_normal_to_fec(conn_info,0,0,out_n,out_arr,out_len,out_delay);
+				}
+				else if(fd64==conn_info.timer.get_timer_fd64())
+				{
+					uint64_t value;
+					read(conn_info.timer.get_timer_fd(), &value, 8);
+					conn_info.conv_manager.clear_inactive();
+					if(debug_force_flush_fec)
+					{
+					from_normal_to_fec(conn_info,0,0,out_n,out_arr,out_len,out_delay);
+					}
+
+					conn_info.stat.report_as_server(ip_port);
+					continue;
 				}
 				else
 				{
-					add_seq(data,data_len);
+					assert(conn_info.conv_manager.is_u64_used(fd64));
 
-					if(jitter_max==0)
+					conv=conn_info.conv_manager.find_conv_by_u64(fd64);
+					conn_info.conv_manager.update_active_time(conv);
+					conn_info.update_active_time();
+
+					int fd=fd_manager.to_fd(fd64);
+					data_len=recv(fd,data,max_data_len,0);
+
+					mylog(log_trace,"received a packet from udp_fd,len:%d,conv=%d\n",data_len,conv);
+
+					if(data_len<0)
 					{
-						char new_data[buf_len];
-						int new_len=0;
-						do_obscure(data, data_len, new_data, new_len);
-						ret = sendto_u64(local_listen_fd, new_data,
-								new_len , 0,u64);
-							add_and_new(udp_fd, dup_num - 1,random_between(dup_delay_min,dup_delay_max), data, data_len,u64);
-						if (ret < 0) {
-							mylog(log_warn, "sento returned %d,%s\n", ret,strerror(errno));
-							//perror("ret<0");
-						}
+						mylog(log_debug,"udp fd,recv_len<0 continue,%s\n",strerror(errno));
+
+						continue;
 					}
-					else
+
+					if(!disable_mtu_warn&&data_len>=mtu_warn)
 					{
-							add_and_new(udp_fd, dup_num,random_between(jitter_min,jitter_max), data, data_len,u64);
+						mylog(log_warn,"huge packet,data len=%d (>=%d).strongly suggested to set a smaller mtu at upper level,to get rid of this warn\n ",data_len,mtu_warn);
 					}
-					packet_send_count++;
 
+					char * new_data;
+					int new_len;
+					put_conv(conv,data,data_len,new_data,new_len);
 
+					from_normal_to_fec(conn_info,new_data,new_len,out_n,out_arr,out_len,out_delay);
 				}
 
-				//mylog(log_trace, "%s :%d\n", inet_ntoa(tmp_sockaddr.sin_addr),
-					//	ntohs(tmp_sockaddr.sin_port));
-				//mylog(log_trace, "%d byte sent\n", ret);
+				mylog(log_trace,"out_n=%d\n",out_n);
+				for(int i=0;i<out_n;i++)
+				{
+					delay_send(out_delay[i],dest,out_arr[i],out_len[i]);
+				}
+				//mylog(log_trace,"[%s] send packet\n",ip_port.to_s());
 
 			}
+			else
+			{
+				mylog(log_fatal,"unknown fd,this should never happen\n");
+				myexit(-1);
+			}
 		}
-		check_delay_map();
-		conn_manager.check_clear_list();
-		if(clear_triggered)   // 删除操作在epoll event的最后进行，防止event cache中的fd失效。
+		delay_manager.check();
+	}
+	return 0;
+}
+
+
+int unit_test()
+{
+	int i,j,k;
+	void *code=fec_new(3,6);
+	char arr[6][100]=
+	{
+		"aaa","bbb","ccc"
+		,"ddd","eee","fff"
+	};
+	char *data[6];
+	for(i=0;i<6;i++)
+	{
+		data[i]=arr[i];
+	}
+	rs_encode2(3,6,data,3);
+	//printf("%d %d",(int)(unsigned char)arr[5][0],(int)('a'^'b'^'c'^'d'^'e'));
+
+	for(i=0;i<6;i++)
+	{
+		printf("<%s>",data[i]);
+	}
+
+	data[0]=0;
+	//data[1]=0;
+	//data[5]=0;
+
+	int ret=rs_decode2(3,6,data,3);
+	printf("ret:%d\n",ret);
+
+	for(i=0;i<6;i++)
+	{
+		printf("<%s>",data[i]);
+	}
+	fec_free(code);
+
+
+	char arr2[6][100]=
+	{
+		"aaa11111","","ccc333333333"
+		,"ddd444","eee5555","ff6666"
+	};
+	blob_encode_t blob_encode;
+	for(int i=0;i<6;i++)
+		blob_encode.input(arr2[i],strlen(arr2[i]));
+
+	char **output;
+	int shard_len;
+	blob_encode.output(7,output,shard_len);
+
+
+	printf("<shard_len:%d>",shard_len);
+	blob_decode_t blob_decode;
+	for(int i=0;i<7;i++)
+	{
+		blob_decode.input(output[i],shard_len);
+	}
+
+	char **decode_output;
+	int * len_arr;
+	int num;
+
+
+	ret=blob_decode.output(num,decode_output,len_arr);
+
+	printf("<num:%d,ret:%d>\n",num,ret);
+	for(int i=0;i<num;i++)
+	{
+		char buf[1000]={0};
+		memcpy(buf,decode_output[i],len_arr[i]);
+		printf("<%d:%s>",len_arr[i],buf);
+	}
+	printf("\n");
+	static fec_encode_manager_t fec_encode_manager;
+	static fec_decode_manager_t fec_decode_manager;
+
+	{
+
+		string a = "11111";
+		string b = "22";
+		string c = "33333333";
+
+		fec_encode_manager.input((char *) a.c_str(), a.length());
+		fec_encode_manager.input((char *) b.c_str(), b.length());
+		fec_encode_manager.input((char *) c.c_str(), c.length());
+		fec_encode_manager.input(0, 0);
+
+		int n;
+		char **s_arr;
+		int *len;
+
+
+		fec_encode_manager.output(n,s_arr,len);
+		printf("<n:%d,len:%d>",n,len[0]);
+
+		for(int i=0;i<n;i++)
 		{
-			u64_t value;
-			read(clear_timer_fd, &value, 8);
-			mylog(log_trace, "timer!\n");
-			conn_manager.clear_inactive();
+			fec_decode_manager.input(s_arr[i],len[i]);
+		}
+
+		{
+			int n;char ** s_arr;int* len_arr;
+			fec_decode_manager.output(n,s_arr,len_arr);
+			printf("<n:%d>",n);
+			for(int i=0;i<n;i++)
+			{
+				s_arr[i][len_arr[i]]=0;
+				printf("<%s>\n",s_arr[i]);
+			}
+		}
+
+
+	}
+
+	{
+		string a = "aaaaaaa";
+		string b = "bbbbbbbbbbbbb";
+		string c = "ccc";
+
+
+		fec_encode_manager.input((char *) a.c_str(), a.length());
+		fec_encode_manager.input((char *) b.c_str(), b.length());
+		fec_encode_manager.input((char *) c.c_str(), c.length());
+		fec_encode_manager.input(0, 0);
+
+		int n;
+		char **s_arr;
+		int * len;
+
+
+		fec_encode_manager.output(n,s_arr,len);
+		printf("<n:%d,len:%d>",n,len[0]);
+
+		for(int i=0;i<n;i++)
+		{
+			if(i==1||i==3||i==5||i==0)
+			fec_decode_manager.input(s_arr[i],len[i]);
+		}
+
+		{
+			int n;char ** s_arr;int* len_arr;
+			fec_decode_manager.output(n,s_arr,len_arr);
+			printf("<n:%d>",n);
+			for(int i=0;i<n;i++)
+			{
+				s_arr[i][len_arr[i]]=0;
+				printf("<%s>\n",s_arr[i]);
+			}
 		}
 	}
-	myexit(0);
+
+	for(int i=0;i<10;i++)
+	{
+		string a = "aaaaaaaaaaaaaaaaaaaaaaa";
+		string b = "bbbbbbbbbbbbb";
+		string c = "cccccccccccccccccc";
+
+
+
+		printf("======\n");
+		int n;
+		char **s_arr;
+		int * len;
+		fec_decode_manager.output(n,s_arr,len);
+
+		fec_encode_manager.re_init(3,2,fec_mtu,fec_pending_num,fec_pending_time,1);
+
+		fec_encode_manager.input((char *) a.c_str(), a.length());
+		fec_encode_manager.output(n,s_arr,len);
+		assert(n==1);
+
+		fec_decode_manager.input(s_arr[0],len[0]);
+
+		fec_decode_manager.output(n,s_arr,len);
+		assert(n==1);
+		printf("%s\n",s_arr[0]);
+
+		fec_encode_manager.input((char *) b.c_str(), b.length());
+		fec_encode_manager.output(n,s_arr,len);
+		assert(n==1);
+		//fec_decode_manager.input(s_arr[0],len[0]);
+
+
+		fec_encode_manager.input((char *) c.c_str(), c.length());
+		fec_encode_manager.output(n,s_arr,len);
+
+		assert(n==3);
+
+		fec_decode_manager.input(s_arr[0],len[0]);
+		//printf("n=%d\n",n);
+
+
+		{
+			int n;
+			char **s_arr;
+			int * len;
+			fec_decode_manager.output(n,s_arr,len);
+			assert(n==1);
+			printf("%s\n",s_arr[0]);
+		}
+
+		fec_decode_manager.input(s_arr[1],len[1]);
+
+		{
+			int n;
+			char **s_arr;
+			int * len;
+			fec_decode_manager.output(n,s_arr,len);
+			assert(n==1);
+			printf("n=%d\n",n);
+			s_arr[0][len[0]]=0;
+			printf("%s\n",s_arr[0]);
+		}
+
+	}
+
 	return 0;
 }
 void print_help()
 {
-	printf("UDPspeeder\n");
-	printf("version: %s %s\n",__DATE__,__TIME__);
+	char git_version_buf[100]={0};
+	strncpy(git_version_buf,gitversion,10);
+
+	printf("UDPspeeder V2\n");
+	printf("git version:%s    ",git_version_buf);
+	printf("build date:%s %s\n",__DATE__,__TIME__);
 	printf("repository: https://github.com/wangyu-/UDPspeeder\n");
 	printf("\n");
 	printf("usage:\n");
@@ -932,33 +1166,47 @@ void print_help()
 	printf("    run as server : ./this_program -s -l server_listen_ip:server_port -r remote_ip:remote_port  [options]\n");
 	printf("\n");
 	printf("common option,must be same on both sides:\n");
-	printf("    -k,--key              <string>        key for simple xor encryption,default:\"secret key\"\n");
+	printf("    -k,--key              <string>        key for simple xor encryption. if not set,xor is disabled\n");
 
 	printf("main options:\n");
-	printf("    -d                    <number>        duplicated packet number, -d 0 means no duplicate. default value:0\n");
-	printf("    -t                    <number>        duplicated packet delay time, unit: 0.1ms,default value:20(2ms)\n");
-	printf("    -j                    <number>        simulated jitter.randomly delay first packet for 0~jitter_value*0.1 ms,to\n");
-	printf("                                          create simulated jitter.default value:0.do not use if you dont\n");
-	printf("                                          know what it means\n");
-	printf("    --report              <number>        turn on udp send/recv report,and set a time interval for reporting,unit:s\n");
+	printf("    -f,--fec              x:y             forward error correction,send y redundant packets for every x packets\n");
+	printf("    --timeout             <number>        how long could a packet be held in queue before doing fec,unit: ms,default :8ms\n");
+	printf("    --mode                <number>        fec-mode,available values: 0,1 ; 0 cost less bandwidth,1 cost less latency(default)\n");
+	printf("    --report              <number>        turn on send/recv report,and set a period for reporting,unit:s\n");
+
 	printf("advanced options:\n");
-	printf("    -t                    tmin:tmax       simliar to -t above,but delay randomly between tmin and tmax\n");
-	printf("    -j                    jmin:jmax       simliar to -j above,but create jitter randomly between jmin and jmax\n");
-	printf("    --random-drop         <number>        simulate packet loss ,unit 0.01%%\n");
-	printf("    -m                    <number>        max pending packets,to prevent the program from eating up all your memory.\n");
-	printf("other options:\n");
+	printf("    --mtu                 <number>        mtu. for mode 0,the program will split packet to segment smaller than mtu_value.\n");
+	printf("                                          for mode 1,no packet will be split,the program just check if the mtu is exceed.\n");
+	printf("                                          default value:1250 \n");
+	printf("    -j,--jitter           <number>        simulated jitter.randomly delay first packet for 0~<number> ms,default value:0.\n");
+	printf("                                          do not use if you dont know what it means.\n");
+	printf("    -i,--interval         <number>        scatter each fec group to a interval of <number> ms,to protect burst packet loss.\n");
+	printf("                                          default value:0.do not use if you dont know what it means.\n");
+	printf("    --random-drop         <number>        simulate packet loss ,unit:0.01%%. default value: 0\n");
+	printf("    --disable-obscure     <number>        disable obscure,to save a bit bandwidth and cpu\n");
+//	printf("    --disable-xor         <number>        disable xor\n");
+
+	printf("developer options:\n");
+	printf("    -j ,--jitter          jmin:jmax       similiar to -j above,but create jitter randomly between jmin and jmax\n");
+	printf("    -i,--interval         imin:imax       similiar to -i above,but scatter randomly between imin and imax\n");
+    printf("    -q,--queue-len        <number>        max fec queue len,only for mode 0\n");
+    printf("    --decode-buf          <number>        size of buffer of fec decoder,unit:packet,default:2000\n");
+    printf("    --fix-latency         <number>        try to stabilize latency,only for mode 0\n");
+    printf("    --delay-capacity      <number>        max number of delayed packets\n");
+	printf("    --disable-fec         <number>        completely disable fec,turn the program into a normal udp tunnel\n");
+	printf("    --sock-buf            <number>        buf size for socket,>=10 and <=10240,unit:kbyte,default:1024\n");
+	printf("log and help options:\n");
 	printf("    --log-level           <number>        0:never    1:fatal   2:error   3:warn \n");
 	printf("                                          4:info (default)     5:debug   6:trace\n");
 	printf("    --log-position                        enable file name,function name,line number in log\n");
 	printf("    --disable-color                       disable log color\n");
-	printf("    --sock-buf            <number>        buf size for socket,>=10 and <=10240,unit:kbyte,default:1024\n");
-	//printf("    -p                                    use multi-process mode instead of epoll.very costly,only for test,do dont use\n");
 	printf("    -h,--help                             print this help message\n");
 
 	//printf("common options,these options must be same on both side\n");
 }
 void process_arg(int argc, char *argv[])
 {
+	int is_client=0,is_server=0;
 	int i, j, k;
 	int opt;
     static struct option long_options[] =
@@ -967,9 +1215,22 @@ void process_arg(int argc, char *argv[])
 		{"log-position", no_argument,    0, 1},
 		{"disable-color", no_argument,    0, 1},
 		{"disable-filter", no_argument,    0, 1},
+		{"disable-fec", no_argument,    0, 1},
+		{"disable-obscure", no_argument,    0, 1},
+		{"disable-xor", no_argument,    0, 1},
+		{"fix-latency", no_argument,    0, 1},
 		{"sock-buf", required_argument,    0, 1},
 		{"random-drop", required_argument,    0, 1},
 		{"report", required_argument,    0, 1},
+		{"delay-capacity", required_argument,    0, 1},
+		{"mtu", required_argument,    0, 1},
+		{"mode", required_argument,   0,1},
+		{"timeout", required_argument,   0,1},
+		{"decode-buf", required_argument,   0,1},
+		{"queue-len", required_argument,   0,'q'},
+		{"fec", required_argument,   0,'f'},
+		{"jitter", required_argument,   0,'j'},
+
 		{NULL, 0, 0, 0}
       };
     int option_index = 0;
@@ -977,6 +1238,14 @@ void process_arg(int argc, char *argv[])
 	{
 		print_help();
 		myexit( -1);
+	}
+	for (i = 0; i < argc; i++)
+	{
+		if(strcmp(argv[i],"--unit-test")==0)
+		{
+			unit_test();
+			myexit(0);
+		}
 	}
 	for (i = 0; i < argc; i++)
 	{
@@ -1023,15 +1292,12 @@ void process_arg(int argc, char *argv[])
 	}
 
 	int no_l = 1, no_r = 1;
-	while ((opt = getopt_long(argc, argv, "l:r:d:t:hcspk:j:m:",long_options,&option_index)) != -1)
+	while ((opt = getopt_long(argc, argv, "l:r:hcsk:j:f:p:n:i:",long_options,&option_index)) != -1)
 	{
 		//string opt_key;
 		//opt_key+=opt;
 		switch (opt)
 		{
-		case 'p':
-			multi_process_mode=1;
-			break;
 		case 'k':
 			sscanf(optarg,"%s\n",key_string);
 			mylog(log_debug,"key=%s\n",key_string);
@@ -1041,28 +1307,20 @@ void process_arg(int argc, char *argv[])
 				myexit(-1);
 			}
 			break;
-
-		case 'm':
-			sscanf(optarg,"%d\n",&max_pending_packet);
-			if(max_pending_packet<1000)
-			{
-				mylog(log_fatal,"max_pending_packet must be >1000\n");
-				myexit(-1);
-			}
-			break;
-
 		case 'j':
 			if (strchr(optarg, ':') == 0)
 			{
 				int jitter;
 				sscanf(optarg,"%d\n",&jitter);
-				if(jitter<0 ||jitter>1000*100)
+				if(jitter<0 ||jitter>1000*10)
 				{
-					mylog(log_fatal,"jitter must be between 0 and 100,000(10 second)\n");
+					mylog(log_fatal,"jitter must be between 0 and 10,000(10 second)\n");
 					myexit(-1);
 				}
 				jitter_min=0;
 				jitter_max=jitter;
+
+
 			}
 			else
 			{
@@ -1073,39 +1331,57 @@ void process_arg(int argc, char *argv[])
 					myexit(-1);
 				}
 			}
+			jitter_min*=1000;
+			jitter_max*=1000;
 			break;
-		case 't':
+		case 'i':
 			if (strchr(optarg, ':') == 0)
 			{
-				int dup_delay=-1;
-				sscanf(optarg,"%d\n",&dup_delay);
-				if(dup_delay<1||dup_delay>1000*100)
+				int output_interval=-1;
+				sscanf(optarg,"%d\n",&output_interval);
+				if(output_interval<0||output_interval>1000*10)
 				{
-					mylog(log_fatal,"dup_delay must be between 1 and 100,000(10 second)\n");
+					mylog(log_fatal,"output_interval must be between 0 and 10,000(10 second)\n");
 					myexit(-1);
 				}
-				dup_delay_min=dup_delay_max=dup_delay;
+				output_interval_min=output_interval_max=output_interval;
 			}
 			else
 			{
-				sscanf(optarg,"%d:%d\n",&dup_delay_min,&dup_delay_max);
-				if(dup_delay_min<1 ||dup_delay_max<1||dup_delay_min>dup_delay_max)
+				sscanf(optarg,"%d:%d\n",&output_interval_min,&output_interval_max);
+				if(output_interval_min<0 ||output_interval_max<0||output_interval_min>output_interval_max)
 				{
-					mylog(log_fatal," must satisfy  1<=dmin<=dmax\n");
+					mylog(log_fatal," must satisfy  0<=output_interval_min<=output_interval_max\n");
+					myexit(-1);
+				}
+			}
+			output_interval_min*=1000;
+			output_interval_max*=1000;
+			break;
+		case 'f':
+			if (strchr(optarg, ':') == 0)
+			{
+				mylog(log_fatal,"invalid format for f");
+				myexit(-1);
+			}
+			else
+			{
+				sscanf(optarg,"%d:%d\n",&fec_data_num,&fec_redundant_num);
+				if(fec_data_num<1 ||fec_redundant_num<0||fec_data_num+fec_redundant_num>254)
+				{
+					mylog(log_fatal,"fec_data_num<1 ||fec_redundant_num<0||fec_data_num+fec_redundant_num>254\n");
 					myexit(-1);
 				}
 			}
 			break;
-		case 'd':
-			dup_num=-1;
-			sscanf(optarg,"%d\n",&dup_num);
-			if(dup_num<0 ||dup_num>5)
+		case 'q':
+			sscanf(optarg,"%d",&fec_pending_num);
+			if(fec_pending_num<1||fec_pending_num>10000)
 			{
-				mylog(log_fatal,"dup_num must be between 0 and 5\n");
-				myexit(-1);
+
+					mylog(log_fatal,"fec_pending_num should be between 1 and 10000\n");
+					myexit(-1);
 			}
-			dup_num+=1;
-			break;
 		case 'c':
 			is_client = 1;
 			break;
@@ -1116,13 +1392,13 @@ void process_arg(int argc, char *argv[])
 			no_l = 0;
 			if (strchr(optarg, ':') != 0)
 			{
-				sscanf(optarg, "%[^:]:%d", local_address, &local_port);
+				sscanf(optarg, "%[^:]:%d", local_ip, &local_port);
 			}
 			else
 			{
 				mylog(log_fatal," -r ip:port\n");
 				myexit(1);
-				strcpy(local_address, "127.0.0.1");
+				strcpy(local_ip, "127.0.0.1");
 				sscanf(optarg, "%d", &local_port);
 			}
 			break;
@@ -1132,14 +1408,14 @@ void process_arg(int argc, char *argv[])
 			{
 				//printf("in :\n");
 				//printf("%s\n",optarg);
-				sscanf(optarg, "%[^:]:%d", remote_address, &remote_port);
+				sscanf(optarg, "%[^:]:%d", remote_ip, &remote_port);
 				//printf("%d\n",remote_port);
 			}
 			else
 			{
 				mylog(log_fatal," -r ip:port\n");
 				myexit(1);
-				strcpy(remote_address, "127.0.0.1");
+				strcpy(remote_ip, "127.0.0.1");
 				sscanf(optarg, "%d", &remote_port);
 			}
 			break;
@@ -1158,6 +1434,26 @@ void process_arg(int argc, char *argv[])
 			{
 				//enable_log_color=0;
 			}
+			else if(strcmp(long_options[option_index].name,"disable-fec")==0)
+			{
+				disable_fec=1;
+			}
+			else if(strcmp(long_options[option_index].name,"disable-obscure")==0)
+			{
+				mylog(log_info,"obscure disabled\n");
+				disable_obscure=1;
+			}
+			else if(strcmp(long_options[option_index].name,"disable-xor")==0)
+			{
+				mylog(log_info,"xor disabled\n");
+				disable_xor=1;
+			}
+			else if(strcmp(long_options[option_index].name,"fix-latency")==0)
+			{
+				mylog(log_info,"fix-latency enabled\n");
+				fix_latency=1;
+			}
+
 			else if(strcmp(long_options[option_index].name,"log-position")==0)
 			{
 				enable_log_position=1;
@@ -1168,6 +1464,17 @@ void process_arg(int argc, char *argv[])
 				if(random_drop<0||random_drop>10000)
 				{
 					mylog(log_fatal,"random_drop must be between 0 10000 \n");
+					myexit(-1);
+				}
+				mylog(log_info,"random_drop=%d\n",random_drop);
+			}
+			else if(strcmp(long_options[option_index].name,"delay-capacity")==0)
+			{
+				sscanf(optarg,"%d",&delay_capacity);
+
+				if(delay_capacity<0)
+				{
+					mylog(log_fatal,"delay_capacity must be >=0 \n");
 					myexit(-1);
 				}
 			}
@@ -1194,6 +1501,45 @@ void process_arg(int argc, char *argv[])
 					mylog(log_fatal,"sock-buf value must be between 1 and 10240 (kbyte) \n");
 					myexit(-1);
 				}
+			}
+			else if(strcmp(long_options[option_index].name,"decode-buf")==0)
+			{
+				sscanf(optarg,"%d",&fec_buff_num);
+				if(fec_buff_num<300 || fec_buff_num>20000)
+				{
+					mylog(log_fatal,"decode-buf value must be between 300 and 20000 (kbyte) \n");
+					myexit(-1);
+				}
+				mylog(log_info,"decode-buf=%d\n",fec_buff_num);
+			}
+			else if(strcmp(long_options[option_index].name,"mode")==0)
+			{
+				sscanf(optarg,"%d",&fec_type);
+				if(fec_type!=0&&fec_type!=1)
+				{
+					mylog(log_fatal,"mode should be 0 or 1\n");
+					myexit(-1);
+				}
+			}
+			else if(strcmp(long_options[option_index].name,"mtu")==0)
+			{
+				sscanf(optarg,"%d",&fec_mtu);
+				if(fec_mtu<100||fec_mtu>2000)
+				{
+					mylog(log_fatal,"fec_mtu should be between 100 and 2000\n");
+					myexit(-1);
+				}
+			}
+			else if(strcmp(long_options[option_index].name,"timeout")==0)
+			{
+				sscanf(optarg,"%d",&fec_pending_time);
+				if(fec_pending_time<0||fec_pending_time>1000)
+				{
+
+						mylog(log_fatal,"fec_pending_time should be between 0 and 1000(1s)\n");
+						myexit(-1);
+				}
+				fec_pending_time*=1000;
 			}
 			else
 			{
@@ -1223,29 +1569,59 @@ void process_arg(int argc, char *argv[])
 		mylog(log_fatal,"-s -c cant be both set\n");
 		myexit(-1);
 	}
+	if(is_client==1)
+	{
+		program_mode=client_mode;
+	}
+	else
+	{
+		program_mode=server_mode;
+	}
+
+	mylog(log_info,"jitter_min=%d jitter_max=%d output_interval_min=%d output_interval_max=%d fec_pending_num=%d fec_data_num=%d fec_redundant_num=%d fec_mtu=%d fec_pending_time=%d fec_type=%d\n",
+			jitter_min/1000,jitter_max/1000,output_interval_min/1000,output_interval_max/1000,fec_pending_time/1000,
+			fec_data_num,fec_redundant_num,fec_mtu,fec_pending_num,fec_type);
 }
+
 int main(int argc, char *argv[])
 {
+
+	/*
+	if(argc==1||argc==0)
+	{
+		printf("this_program classic\n");
+		printf("this_program fec\n");
+		return 0;
+	}*/
+	/*
+	if(argc>=2&&strcmp(argv[1],"fec")!=0)
+	{
+		printf("running into classic mode!\n");
+		return classic::main(argc,argv);
+	}*/
+
 	assert(sizeof(u64_t)==8);
 	assert(sizeof(i64_t)==8);
 	assert(sizeof(u32_t)==4);
 	assert(sizeof(i32_t)==4);
+	assert(sizeof(u16_t)==2);
+	assert(sizeof(i16_t)==2);
 	dup2(1, 2);		//redirect stderr to stdout
 	int i, j, k;
 	process_arg(argc,argv);
-	init_random_number_fd();
-	anti_replay.prepare();
 
-	remote_address_uint32=inet_addr(remote_address);
+	delay_manager.set_capacity(delay_capacity);
+	local_ip_uint32=inet_addr(local_ip);
+	remote_ip_uint32=inet_addr(remote_ip);
 
-	if(!multi_process_mode)
+	if(program_mode==client_mode)
 	{
-		event_loop();
+		client_event_loop();
 	}
 	else
 	{
+		server_event_loop();
 	}
-
 
 	return 0;
 }
